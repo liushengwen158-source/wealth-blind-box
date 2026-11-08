@@ -2,6 +2,9 @@
 # 运行：python -m uvicorn main:app --port 8000
 # 打开 http://127.0.0.1:8000 ，点「开始比赛」，就能看到一回合自己跑完。
 
+import csv
+import io
+import json
 import random
 import sqlite3
 import threading
@@ -10,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 import db
@@ -35,6 +38,53 @@ db.初始化()
 日志: list[str] = []
 
 随机 = random.Random(20261107)     # 固定种子，方便复盘
+
+
+# ---------------- 存档 / 读档：让比赛活过重启 ----------------
+def _存比赛状态():
+    """把「第几回合、还剩多久、各人本回合从多少本金起算」写进数据库。
+
+    为什么要存：回合状态原来只在内存里，黑色窗口一关（或者程序崩一次），
+    比赛就退回「未开始」，钱和订单还在库里，比赛却没了 —— 演示时被人问「怎么又变回没开始」
+    就是这么来的。存下来之后重启能接着跑，停机那段时间按暂停算。
+    """
+    c = db.连接()
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO game_state "
+            "(id, status, round_index, total_rounds, round_ms, remain_ms,"
+            " started_at, start_assets, logs) VALUES (1,?,?,?,?,?,?,?,?)",
+            (引擎.状态, 引擎.回合序号, 引擎.总回合数, 引擎.回合毫秒, 引擎.剩余毫秒(),
+             开赛时刻, json.dumps(起始资产), json.dumps(日志[-50:], ensure_ascii=False)))
+        c.commit()
+    finally:
+        c.close()
+
+
+def _载比赛状态():
+    """启动时读一次存档。没有存档、或者存档坏了，就当没比过，服务照常起来。"""
+    global 开赛时刻
+    c = db.连接()
+    try:
+        行 = c.execute("SELECT * FROM game_state WHERE id = 1").fetchone()
+    finally:
+        c.close()
+    if 行 is None:
+        return False
+    if not 引擎.恢复({"状态": 行["status"], "回合序号": 行["round_index"],
+                    "总回合数": 行["total_rounds"], "回合毫秒": 行["round_ms"],
+                    "剩余毫秒": 行["remain_ms"]}):
+        return False
+    try:
+        起始资产.update({int(k): int(v) for k, v in json.loads(行["start_assets"]).items()})
+        日志.extend(json.loads(行["logs"]))
+    except (ValueError, TypeError):
+        pass
+    开赛时刻 = 行["started_at"]
+    if 引擎.状态 in ("RUNNING", "PAUSED"):
+        日志.append(f"服务重启，已从存档恢复：第 {引擎.回合序号} 回合，剩余 "
+                    f"{引擎.剩余毫秒() // 1000} 秒（停机时间按暂停算）")
+    return True
 
 # ---------------- 假行情（分支一交付后整块替换） ----------------
 行情表 = {
@@ -186,6 +236,7 @@ def _结算并推进():
         _快照起始资产()
     else:
         日志.append("整场比赛已结算，可以导出成绩了")
+    _存比赛状态()
 
 
 # ---------------- 两个自动交易的选手（让排行榜有可比对象） ----------------
@@ -226,6 +277,7 @@ def _机器人行动():
 
 
 def _行情线程():
+    下次存盘 = 0.0
     while True:
         time.sleep(0.3)
         try:
@@ -236,11 +288,17 @@ def _行情线程():
                     _撮合挂单()
                     if 引擎.剩余毫秒() <= 0:
                         _结算并推进()
+                # 每 5 秒把剩余时间刷新一次。只在状态切换时存的话，
+                # 跑到一半断电，重启会退回存盘那一刻的时间，白白多给选手几十秒。
+                if time.monotonic() >= 下次存盘 and 引擎.状态 in ("RUNNING", "PAUSED"):
+                    _存比赛状态()
+                    下次存盘 = time.monotonic() + 5
         except Exception as e:                       # 后台线程不能死，否则比赛卡住
             日志.append(f"后台出错：{e}")
 
 
 threading.Thread(target=_行情线程, daemon=True).start()
+_载比赛状态()      # 有存档就接着上次的进度；没有就维持「未开始」
 
 
 # ---------------- 比赛状态与控制 ----------------
@@ -280,6 +338,7 @@ def 练习模式():
         引擎.开赛(总回合数=1, 回合毫秒=24 * 3600 * 1000)     # 24 小时，等于不会结束
         _快照起始资产()
         日志.append("练习模式开始：不限时，可以随便买卖，不会结算")
+        _存比赛状态()
     return 比赛状态()
 
 
@@ -309,6 +368,7 @@ def 开始比赛(请求: 开赛请求):
         _快照起始资产()
         日志.append(f"比赛开始：共 {请求.rounds} 回合，每回合 {请求.seconds} 秒")
         日志.append(f"第 1 回合：{当前事件()['title']}")
+        _存比赛状态()
     return 比赛状态()
 
 
@@ -318,6 +378,7 @@ def 暂停():
         if not 引擎.暂停():
             raise 规则拒绝("ROUND_NOT_RUNNING", "当前不是进行中状态")
         日志.append(f"管理员暂停，剩余 {引擎.剩余毫秒() // 1000} 秒已冻结")
+        _存比赛状态()
     return 比赛状态()
 
 
@@ -327,6 +388,7 @@ def 继续():
         if not 引擎.继续():
             raise 规则拒绝("ROUND_NOT_RUNNING", "当前不是暂停状态")
         日志.append("管理员继续比赛")
+        _存比赛状态()
     return 比赛状态()
 
 
@@ -364,6 +426,7 @@ def 结束锁定():
             raise 规则拒绝("ROUND_NOT_RUNNING", "比赛还没开始或已经锁定")
         _撤销全部挂单()          # 锁了就别再留挂单，冻结的钱股要退回给选手
         日志.append("管理员结束并锁定比赛，之后不再接受下单")
+        _存比赛状态()
     return 比赛状态()
 
 
@@ -840,6 +903,79 @@ def 我的成绩(用户: sqlite3.Row = Depends(认人)):
         c.close()
 
 
+# ---------------- 导出成绩 ----------------
+# 文档里写的是 GET /admin/export?type=results|trades|orders|events，返回文件流。
+# 这里出 CSV 而不是 XLSX：不引第三方库，Excel/WPS 双击就能开，也够交作业用。
+def _元(分: int) -> str:
+    """给导出的表格用「元」，行内选手看得懂；接口内部仍然全是整数分。"""
+    return f"{分 / 100:.2f}"
+
+
+def _csv文本(表头: list[str], 行们: list[list]) -> str:
+    buf = io.StringIO()
+    # Excel 只认 \r\n 换行；用 \n 在部分版本里会把整表挤成一行
+    写 = csv.writer(buf, lineterminator="\r\n")
+    写.writerow(表头)
+    写.writerows(行们)
+    return buf.getvalue()
+
+
+@app.get("/api/v1/admin/export")
+def 导出成绩(type: str = "results"):
+    """导出 CSV。中文不乱码靠两点：utf-8-sig（带 BOM）+ CRLF 换行。"""
+    类型 = (type or "results").lower()
+    c = db.连接()
+    try:
+        if 类型 == "results":
+            表头 = ["回合", "学号", "昵称", "事件", "期初资产(元)", "期末资产(元)",
+                    "盈亏(元)", "收益率", "强制平仓", "结算时刻"]
+            行们 = [[r["round_index"], r["student_no"], r["nickname"],
+                     事件池[(r["round_index"] - 1) % len(事件池)]["title"],
+                     _元(r["start_equity"]), _元(r["end_equity"]), _元(r["pnl"]),
+                     f"{r['pnl'] / r['start_equity'] * 100:.2f}%" if r["start_equity"] else "0.00%",
+                     "是" if r["forced_close"] else "否", r["settled_at"] or ""]
+                    for r in c.execute(
+                        "SELECT r.*, u.student_no, u.nickname FROM round_results r "
+                        "JOIN users u ON u.id = r.user_id "
+                        "ORDER BY r.round_index, r.user_id").fetchall()]
+
+        elif 类型 in ("trades", "orders"):
+            成交 = 类型 == "trades"
+            条件 = "WHERE o.status = 'FILLED'" if 成交 else ""
+            表头 = ["订单号", "学号", "昵称", "代码", "名称", "方向", "类型",
+                    "价格(元)", "数量", "已成交", "状态", "费用合计(元)", "创建时间"]
+            行们 = []
+            for r in c.execute(
+                    f"SELECT o.*, u.student_no, u.nickname FROM orders o "
+                    f"JOIN users u ON u.id = o.user_id {条件} ORDER BY o.id").fetchall():
+                行们.append([
+                    r["order_id"], r["student_no"], r["nickname"], r["symbol"],
+                    行情表.get(r["symbol"], {}).get("name", r["symbol"]),
+                    "买入" if r["side"] == "BUY" else "卖出",
+                    "限价" if r["order_type"] == "LIMIT" else "市价",
+                    _元(r["price"]), r["quantity"], r["filled_qty"], r["status"],
+                    _元(r["fee"]), r["created_at"]])
+
+        elif 类型 == "events":
+            表头 = ["事件编码", "标题", "日期", "类别", "方向", "数据精度", "摘要"]
+            行们 = [[e["id"], e["title"], e["date"], e["category"], e["direction"],
+                     e["dataQuality"], e["summary"]] for e in 事件池]
+
+        else:
+            raise 规则拒绝("NOT_FOUND", "type 只能是 results / trades / orders / events")
+    finally:
+        c.close()
+
+    文本 = _csv文本(表头, 行们)
+    文件名 = f"{类型}-{datetime.now(北京时间).strftime('%Y%m%d-%H%M')}.csv"
+    return Response(
+        content=文本.encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{文件名}"',
+                 "Cache-Control": "no-store"},
+    )
+
+
 # ---------------- 页面 ----------------
 @app.get("/api/v1/version")
 def 版本():
@@ -899,6 +1035,10 @@ th{color:#8a8780;font-weight:400}
         <button id="btnPause" onclick="控制('pause')">暂停</button>
         <button id="btnResume" onclick="控制('resume')">继续</button>
         <button id="btnSkip" onclick="控制('skip')">跳过本回合</button>
+        <button onclick="location.href='/api/v1/admin/export?type=results'"
+                style="border-color:#cfc3ae;color:#8a6d3b">导出成绩 CSV</button>
+        <button onclick="location.href='/api/v1/admin/export?type=trades'"
+                style="border-color:#cfc3ae;color:#8a6d3b">导出成交 CSV</button>
       </div>
     </div>
     <div id="bar"><div id="fill"></div></div>

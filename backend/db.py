@@ -56,6 +56,20 @@ CREATE TABLE IF NOT EXISTS round_results (
     settled_at   TEXT NOT NULL DEFAULT '',   -- 这一回合结算的真实时刻，资产曲线的横轴要用
     PRIMARY KEY (user_id, round_index)
 );
+
+-- 只有一行（id 恒为 1）：把「比赛进行到哪」存下来，服务重启后能接着跑。
+-- 以前这些只在内存里，窗口一关就退回「未开始」，钱和订单还在库里，比赛却没了。
+CREATE TABLE IF NOT EXISTS game_state (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    status       TEXT    NOT NULL,
+    round_index  INTEGER NOT NULL,
+    total_rounds INTEGER NOT NULL,
+    round_ms     INTEGER NOT NULL,
+    remain_ms    INTEGER NOT NULL,           -- 存下来的那一瞬间还剩多久；停机时间当暂停处理
+    started_at   TEXT    NOT NULL DEFAULT '',
+    start_assets TEXT    NOT NULL DEFAULT '{}',   -- JSON：每个选手本回合的起始资产
+    logs         TEXT    NOT NULL DEFAULT '[]'    -- JSON：最近若干条比赛日志
+);
 """
 
 

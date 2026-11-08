@@ -71,6 +71,41 @@ class 回合引擎:
         self._暂停剩余毫秒 = None
         return True
 
+    # ---------------- 存档 / 读档 ----------------
+    # 引擎用单调时钟算倒计时，时钟本身没法存进数据库，能存的只有「还剩多少毫秒」。
+    # 重启后按存下来的剩余时间重新起跑：停机那段时间等于暂停，没让选手白白损失。
+    def 导出(self) -> dict:
+        return {"状态": self.状态, "回合序号": self.回合序号, "总回合数": self.总回合数,
+                "回合毫秒": self.回合毫秒, "剩余毫秒": self.剩余毫秒()}
+
+    def 恢复(self, 档: dict) -> bool:
+        """从存档恢复。存档不合法（字段缺失、数值为负）就当没有存档，别让服务起不来。"""
+        try:
+            状态 = 档["状态"]
+            总 = int(档["总回合数"])
+            每轮 = int(档["回合毫秒"])
+            序号 = int(档["回合序号"])
+            剩余 = int(档["剩余毫秒"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if 状态 not in ("IDLE", "RUNNING", "PAUSED", "SETTLED", "ENDED"):
+            return False
+        if 总 <= 0 or 每轮 <= 0 or 序号 < 0:
+            return False
+
+        self.状态 = 状态
+        self.总回合数 = 总
+        self.回合毫秒 = 每轮
+        self.回合序号 = 序号
+        剩余 = max(0, min(剩余, 每轮))
+        if 状态 == "RUNNING":
+            # 把起点往前挪，让「已用时间 = 总时长 - 剩余」，倒计时从剩余处继续
+            self._本轮开始 = self.时钟() - (每轮 - 剩余) / 1000
+            self._暂停剩余毫秒 = None
+        elif 状态 == "PAUSED":
+            self._暂停剩余毫秒 = 剩余
+        return True
+
     def 结束(self):
         self.状态 = "ENDED"
 
