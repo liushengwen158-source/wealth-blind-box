@@ -1,0 +1,5 @@
+# 后端在这一步只用到 FastAPI + uvicorn；数据库是 Python 自带的 sqlite3，不用装。
+fastapi>=0.110
+uvicorn>=0.27
+# 跑自测用
+pytest>=8.0

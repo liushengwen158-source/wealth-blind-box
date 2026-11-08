@@ -1,0 +1,11 @@
+# 数据库文件是本机账本，不进仓库：每个人的持仓成绩都不一样，提交上去等于把别人的账覆盖掉
+wealth.db
+wealth.db-wal
+wealth.db-shm
+
+# Python 运行时产物
+__pycache__/
+*.pyc
+
+# 测试缓存
+.pytest_cache/
